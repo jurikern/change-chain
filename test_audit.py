@@ -201,9 +201,9 @@ class AuditTest(unittest.TestCase):
         yes += ["x\n\nCo-Authored-By: Claude", "x\n\ngenerated with claude code",
                 "x\n\nCo-authored-by: google-labs-jules[bot] <161369871+google-labs-jules[bot]@users.noreply.github.com>",
                 "x\n\nCo-authored-by: devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>"]
-        no += ["x\n\nCo-Authored-By: Jane Roe <jroe@google.com>",
-               "x\n\nCo-Authored-By: Sam Lee <sam@anthropic.com>",
-               "x\n\nCo-Authored-By: Kim Park <kim@openai.com>",
+        no += ["x\n\nCo-Authored-By: Test Human <synthetic-human-1@google.com>",
+               "x\n\nCo-Authored-By: Test Human <synthetic-human-2@anthropic.com>",
+               "x\n\nCo-Authored-By: Test Human <synthetic-human-3@openai.com>",
                "x\n\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
                "x\n\nCo-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
                "x\n\nCo-Authored-By: Ann <ann.copilotfan@example.com>"]
