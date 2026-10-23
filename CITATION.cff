@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it with the metadata below."
+type: software
+title: "change-chain"
+abstract: "change-chain finds the agent session that made a git commit and the settings version (policy) that was active for that session. It reads local files only and labels each link ESTABLISHED, INFERRED or MISSING."
+authors:
+  - given-names: "Juri"
+    family-names: "Kern"
+    alias: "jkn"
+    affiliation: "Independent researcher"
+    email: "jkn@datapce.com"
+license: MIT
+version: "0.1.0"
+keywords:
+  - provenance
+  - git
+  - coding agents
+  - software supply chain

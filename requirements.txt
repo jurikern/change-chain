@@ -1,0 +1,2 @@
+# No third-party packages. change-chain uses the Python standard library only.
+# Needs: Python >= 3.9 and the git command (2.28 or later for the demo).
