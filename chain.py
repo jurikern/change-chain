@@ -20,6 +20,7 @@ Run:
     python3 chain.py lookup <sha> [--repo PATH] [--json]
     python3 chain.py export [--repo PATH] [--since DATE] > chain.jsonl   # one line per commit
     python3 chain.py coverage [--repo PATH] [--since DATE]               # label counts
+    python3 chain.py audit [--repo PATH] [--since DATE] [--json]         # subagent, trailer and concurrency checks
 
 Default inputs: <state>/otel.jsonl, <state>/policy.jsonl, <state>/deploys.tsv and ~/.claude/projects.
 <state> is $CHANGE_CHAIN_DIR, else $XDG_STATE_HOME/change-chain, else ~/.local/state/change-chain.
@@ -268,8 +269,8 @@ class TranscriptIndex:
     """One pass over all transcripts. Keeps commit outputs and `git commit` calls, no other text."""
 
     def __init__(self, root):
-        self.outputs = []   # (session, ts, cwd, short_sha, subject)
-        self.calls = []     # (session, ts, cwd, tool_use_id, command)
+        self.outputs = []   # (session, ts, cwd, short_sha, subject, agent)
+        self.calls = []     # (session, ts, cwd, tool_use_id, command, agent)
         if not os.path.isdir(root):
             return
         for dirpath, _, files in os.walk(root):
@@ -295,6 +296,8 @@ class TranscriptIndex:
         sid, ts, cwd = rec.get("sessionId"), _ts_or_none(rec.get("timestamp")), rec.get("cwd")
         if not sid or ts is None:
             return
+        # A subagent transcript carries the parent's sessionId plus its own agentId.
+        agent = rec.get("agentId") if rec.get("isSidechain") else None
         msg = rec.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
         for c in content if isinstance(content, list) else []:
@@ -303,25 +306,25 @@ class TranscriptIndex:
             if c.get("type") == "tool_use" and c.get("name") == "Bash":
                 cmd = (c.get("input") or {}).get("command")
                 if isinstance(cmd, str) and COMMIT_CALL.search(cmd):
-                    self.calls.append((sid, ts, cwd, c.get("id"), cmd))
+                    self.calls.append((sid, ts, cwd, c.get("id"), cmd, agent))
             elif c.get("type") == "tool_result":
                 for s in _strings(c.get("content")):
                     for m in COMMIT_OUT.finditer(s):
-                        self.outputs.append((sid, ts, cwd, m.group(1), m.group(2).strip()))
+                        self.outputs.append((sid, ts, cwd, m.group(1), m.group(2).strip(), agent))
 
     def links(self, commit, paths):
         links, ct = [], _ts(commit["commit_time"])
         subj = commit["subject"]
         # The subject must be the whole message line: after a quote or a line start, before a quote or a line end.
         subj_re = re.compile(r"(?:^|['\"])" + re.escape(subj) + r"(?:$|['\"])", re.M) if subj else None
-        for sid, ts, cwd, short, subject in self.outputs:
+        for sid, ts, cwd, short, subject, agent in self.outputs:
             gap = abs((ts - ct).total_seconds())
             if commit["sha"].startswith(short) and subject == subj and gap <= TRANSCRIPT_WINDOW_S:
                 links.append({"session": sid, "label": "INFERRED", "source": "transcript-output",
                               "evidence": f"commit output with SHA {short} and the same subject, {gap:.0f} s "
                                           "from commit time (unsigned text)",
-                              "ts": ts.isoformat(), "tool_use_id": None, "cwd": cwd})
-        for sid, ts, cwd, tool_use_id, cmd in self.calls:
+                              "ts": ts.isoformat(), "tool_use_id": None, "cwd": cwd, "agent": agent})
+        for sid, ts, cwd, tool_use_id, cmd, agent in self.calls:
             if subj_re is None or not subj_re.search(cmd):
                 continue
             gap = abs((ts - ct).total_seconds())
@@ -332,7 +335,7 @@ class TranscriptIndex:
             links.append({"session": sid, "label": "INFERRED", "source": "transcript-call",
                           "evidence": f"git commit call {tool_use_id} with the subject in a repo worktree; "
                                       f"{gap:.0f} s from commit time",
-                          "ts": ts.isoformat(), "tool_use_id": tool_use_id, "cwd": cwd})
+                          "ts": ts.isoformat(), "tool_use_id": tool_use_id, "cwd": cwd, "agent": agent})
         return links
 
 
@@ -621,10 +624,13 @@ def main(argv=None):
     dp = default_paths()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("lookup", "export", "coverage", "demo"):
+    for name in ("lookup", "export", "coverage", "demo", "audit"):
         p = sub.add_parser(name)
         if name == "lookup":
             p.add_argument("sha")
+            p.add_argument("--json", action="store_true")
+        elif name == "audit":
+            p.add_argument("--since")
             p.add_argument("--json", action="store_true")
         elif name == "demo":
             p.add_argument("--sha")
@@ -637,6 +643,16 @@ def main(argv=None):
         p.add_argument("--transcripts", default=dp["transcripts"], help="Claude Code transcript dir")
         p.add_argument("--gh-hosts", default=dp["gh_hosts"], help="gh login file; only its presence is read")
     a = ap.parse_args(argv)
+    if a.cmd == "audit":
+        import audit
+        try:
+            r = audit.run(a.repo, a.since, a.transcripts, a.otel, a.policy, a.deploys, a.gh_hosts)
+        except subprocess.CalledProcessError as e:
+            why = (e.stderr or "").strip().splitlines()
+            print(f"chain.py: error: git failed: {why[0] if why else 'exit ' + str(e.returncode)}", file=sys.stderr)
+            return 2
+        print(json.dumps(r, indent=1) if a.json else audit.render(r))
+        return 0
     src = dict(otel=otel_tool_results(a.otel), transcripts=TranscriptIndex(a.transcripts),
                policy=policy_rows(a.policy), deploys=deploy_rows(a.deploys))
     try:
