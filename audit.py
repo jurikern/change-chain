@@ -11,26 +11,57 @@ Output holds short SHAs, UTC times, labels, short session ids and counts. It nev
 command text, transcript text or paths.
 """
 from __future__ import annotations
-import datetime, json, os, re
+import bisect, datetime, hashlib, json, os, re
 
 import chain
 
 WINDOW_S = 300
-AGENTS = r"(?:Claude|Codex|Copilot|Cursor|Gemini|Aider|OpenCode|Cline|Devin|Jules|Amp|Windsurf|Pi)"
-TRAILER = re.compile(r"^(?:Co-Authored-By:[^\n]*\b" + AGENTS + r"\b|[^\n]*Generated (?:with|by) \[?"
-                     + AGENTS + r")", re.M | re.I)
-TRAILER_TEXT = ("Co-Authored-By: <name with Claude, Codex, Copilot, Cursor, Gemini, Aider, OpenCode, Cline, "
-                "Devin, Jules, Amp, Windsurf or Pi>; or a line 'Generated with/by <same names>'")
+# An agent trailer names a coding agent by its e-mail domain (Co-Authored-By), or by a fixed
+# "Generated with/by <agent>" line, or by a Generated-by / Assisted-by trailer. A person called
+# Claude or Devin with a private address is not an agent.
+AGENT_DOMAINS = ("anthropic.com", "openai.com", "cursor.com", "cursor.sh", "aider.chat", "cognition.ai",
+                 "devin.ai", "ampcode.com", "sourcegraph.com", "windsurf.com", "codeium.com", "opencode.ai",
+                 "cline.bot", "google.com")
+AGENT_NAMES = (r"(?:Claude(?: Code)?|Codex|(?:GitHub )?Copilot|Cursor(?: Agent)?|Gemini(?: CLI| Code Assist)?"
+               r"|Aider|OpenCode|Cline|Devin|Jules|Amp|Windsurf)")
+_COAUTHOR = re.compile(r"^[ \t]*Co-authored-by:[ \t]*([^<\n]*)<([^>\n]*)>", re.M | re.I)
+_GENERATED = re.compile(r"^[ \t]*(?:\W{1,3}[ \t]*)?Generated (?:with|by) \[?" + AGENT_NAMES + r"\b", re.M)
+_TRAILER_KEY = re.compile(r"^[ \t]*(?:Generated|Assisted|AI-assisted)-by:[ \t]*" + AGENT_NAMES + r"\b",
+                          re.M | re.I)
+TRAILER_TEXT = ("Co-Authored-By with an e-mail at %s, or a Copilot or [bot] address; a line 'Generated "
+                "with/by <agent>'; a Generated-by or Assisted-by trailer naming an agent (Claude, Codex, "
+                "Copilot, Cursor, Gemini, Aider, OpenCode, Cline, Devin, Jules, Amp, Windsurf)"
+                % ", ".join(AGENT_DOMAINS))
+# A Bash command that runs git in, or cd's into, an absolute or ~ path.
+_CMD_PATH = re.compile(r"""(?:-C|\bcd)\s+(['"]?)((?:/|~/)[^'"\s;&|)]*)\1""")
+
+
+def is_agent_trailer(body):
+    for _, mail in _COAUTHOR.findall(body):
+        m = mail.strip().lower()
+        dom = m.rsplit("@", 1)[-1]
+        if any(dom == d or dom.endswith("." + d) for d in AGENT_DOMAINS) or "copilot" in m or "[bot]" in m:
+            return True
+    return bool(_GENERATED.search(body) or _TRAILER_KEY.search(body))
+
+
+def _since_git(since):
+    # A bare date means local midnight (as chain.commits_since).
+    return since + "T00:00:00" if since and re.fullmatch(r"\d{4}-\d{2}-\d{2}", since) else since
 
 
 class ActivityIndex:
-    """Agent actors in time: (session, agent or None, ts, cwd) for each transcript record with a cwd."""
+    """Agent actors in time: (ts, session, agent, worktree) for each tool call of an agent in a worktree of
+    the repo. The worktree is the record cwd, or a path the Bash command names with `git -C` or `cd`."""
 
-    def __init__(self, root, since=None):
+    def __init__(self, root, worktrees, since=None, home=None):
         self.recs = []
+        self.first = self.last = None
+        home = home or os.path.expanduser("~")
         cut = since.timestamp() - 86400 if since else None
         if not os.path.isdir(root):
             return
+        times = []
         for dirpath, _, files in os.walk(root):
             for name in files:
                 if not name.endswith(".jsonl"):
@@ -44,56 +75,67 @@ class ActivityIndex:
                     continue
                 with f:
                     for line in f:
-                        if '"cwd"' not in line:
+                        if '"tool_use"' not in line:
                             continue
                         try:
                             r = json.loads(line)
                             ts = chain._ts_or_none(r.get("timestamp"))
                             sid, cwd = r.get("sessionId"), r.get("cwd")
+                            content = r["message"]["content"]
                         except chain.BAD:
                             continue
-                        if not sid or ts is None or not isinstance(cwd, str):
+                        if not sid or ts is None or r.get("type") != "assistant" or not isinstance(content, list):
                             continue
-                        agent = r.get("agentId") if r.get("isSidechain") else None
-                        self.recs.append((ts, sid, agent, cwd))
-        self.recs.sort(key=lambda x: x[0])
-        self.first = self.recs[0][0] if self.recs else None
-        self.last = self.recs[-1][0] if self.recs else None
+                        uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+                        if not uses:
+                            continue
+                        times.append(ts)
+                        agent = (r.get("agentId") or "sidechain") if r.get("isSidechain") else None
+                        wts = set()
+                        if isinstance(cwd, str):
+                            wts.add(_worktree(cwd, worktrees))
+                        for u in uses:
+                            cmd = (u.get("input") or {}).get("command") if u.get("name") == "Bash" else None
+                            if isinstance(cmd, str):
+                                for _, p in _CMD_PATH.findall(cmd):
+                                    wts.add(_worktree(home + p[1:] if p.startswith("~") else p, worktrees))
+                        for wt in wts - {None}:
+                            self.recs.append((ts, sid, agent or "", wt))
+        self.recs.sort()
+        if times:
+            self.first, self.last = min(times), max(times)
 
-    def near(self, when, worktrees):
-        """Actors with a record in a repo worktree within WINDOW_S of `when`: {(session, agent): worktree}."""
-        import bisect
+    def near(self, when):
+        """Actors with a tool call in a repo worktree within WINDOW_S of `when`: {(session, agent): {worktree}}."""
         lo = bisect.bisect_left(self.recs, (when - datetime.timedelta(seconds=WINDOW_S),))
-        hi = bisect.bisect_right(self.recs, (when + datetime.timedelta(seconds=WINDOW_S), "￿"))
+        hi = bisect.bisect_right(self.recs, (when + datetime.timedelta(seconds=WINDOW_S), "\uffff"))
         out = {}
-        for ts, sid, agent, cwd in self.recs[lo:hi]:
-            wt = _worktree(cwd, worktrees)
-            if wt:
-                out.setdefault((sid, agent), set()).add(wt)
+        for ts, sid, agent, wt in self.recs[lo:hi]:
+            out.setdefault((sid, agent), set()).add(wt)
         return out
 
 
-def _worktree(cwd, worktrees):
-    c = os.path.realpath(cwd)
+def _worktree(path, worktrees):
+    c = os.path.realpath(path)
     best = [p for p in worktrees if c == p or c.startswith(p + os.sep)]
     return max(best, key=len) if best else None
 
 
-def trailers(repo, shas):
-    """sha -> True if the commit message has an agent trailer."""
+def trailers(repo, since):
+    """sha -> True if the commit message has an agent trailer. One git call over the same commits as
+    chain.commits_since (no SHA list on the command line)."""
+    args = ["log", "--branches", "--tags", "--format=%H%x00%B%x1e"] + ([f"--since={_since_git(since)}"] if since else [])
     out = {}
-    if not shas:
-        return out
-    log = chain._git(repo, "log", "--no-walk=unsorted", "--format=%H%x00%B%x1e", *shas)
-    for chunk in log.split("\x1e"):
+    for chunk in chain._git(repo, *args).split("\x1e"):
         chunk = chunk.strip("\n")
         if "\x00" in chunk:
             h, body = chunk.split("\x00", 1)
-            out[h] = bool(TRAILER.search(body))
+            out[h] = is_agent_trailer(body)
     return out
 
 
-def run(repo, since, transcripts_root, otel_path=None, policy_path=None, deploys_path=None, gh_hosts=None):
+def run(repo, since, transcripts_root, otel_path=None, policy_path=None, deploys_path=None, gh_hosts=None,
+        hash_repo=False):
     dp = chain.default_paths()
     src = dict(otel=chain.otel_tool_results(otel_path or dp["otel"]),
                transcripts=chain.TranscriptIndex(transcripts_root),
@@ -101,12 +143,17 @@ def run(repo, since, transcripts_root, otel_path=None, policy_path=None, deploys
                deploys=chain.deploy_rows(deploys_path or dp["deploys"]))
     src["forge"] = chain.forge_state(repo, gh_hosts or dp["gh_hosts"])
     shas = chain.commits_since(repo, since)
-    since_t = chain._ts(since + "T00:00:00" if since and len(since) == 10 else since) if since else None
-    act = ActivityIndex(transcripts_root, since_t)
-    windows = chain.source_windows(src["otel"], src["transcripts"], src["policy"], src["deploys"])
+    try:
+        since_t = chain._ts(_since_git(since)) if since else None
+    except ValueError:
+        since_t = None   # a git date form ("2.weeks"): read every transcript file
     worktrees = chain.repo_paths(repo)
-    trl = trailers(repo, shas)
-    res = {"repo": os.path.basename(os.path.realpath(repo)), "since": since, "window_s": WINDOW_S,
+    act = ActivityIndex(transcripts_root, worktrees, since_t)
+    windows = chain.source_windows(src["otel"], src["transcripts"], src["policy"], src["deploys"])
+    trl = trailers(repo, since)
+    top = os.path.realpath(chain._git(repo, "rev-parse", "--show-toplevel").strip())
+    label = ("r-" + hashlib.sha256(top.encode()).hexdigest()[:8]) if hash_repo else os.path.basename(top)
+    res = {"repo": label, "since": since, "window_s": WINDOW_S,
            "transcript_window": [act.first.isoformat() if act.first else None,
                                  act.last.isoformat() if act.last else None],
            "worktrees": len(worktrees), "commits": len(shas), "in_window": 0, "out_of_window": 0,
@@ -124,7 +171,7 @@ def run(repo, since, transcripts_root, otel_path=None, policy_path=None, deploys
         res["in_window" if inwin else "out_of_window"] += 1
         has_t = trl.get(c["sha"], False)
         res["trailer"] += has_t
-        near = act.near(ct, worktrees)
+        near = act.near(ct)
         wts = set().union(*near.values()) if near else set()
         row = {"sha": short, "time": ct.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                "label": s["label"], "session": (s["session"] or "-")[:8],
@@ -161,12 +208,17 @@ def run(repo, since, transcripts_root, otel_path=None, policy_path=None, deploys
     return res
 
 
-def _shas(xs, limit):
-    more = f" (+{len(xs) - limit} more)" if len(xs) > limit else ""
-    return (", ".join(xs[:limit]) + more) if xs else "-"
+def _shas(xs, limit, indent):
+    """Short SHAs, 6 per line. limit=None: all."""
+    shown = xs if limit is None else xs[:limit]
+    more = f" (+{len(xs) - len(shown)} more; use --json)" if len(shown) < len(xs) else ""
+    if not xs:
+        return "-"
+    lines = [", ".join(shown[i:i + 6]) for i in range(0, len(shown), 6)]
+    return (",\n" + " " * indent).join(lines) + more
 
 
-def render(r, limit=10):
+def render(r, limit=None):
     n = r["commits"]
     pct = lambda k: f"{100 * k / n:5.1f}%" if n else "    -"
     tw = r["transcript_window"]
@@ -195,11 +247,12 @@ def render(r, limit=10):
               (f"more than one agent actor in the repo within {r['window_s']} s", "multi_actor"),
               ("  of those, actors in more than one worktree", "multi_worktree")]
     for name, k in checks:
-        out.append(f"  {name:<52} {len(r[k]):>5}   {_shas(r[k], limit)}")
+        out.append(f"  {name:<52} {len(r[k]):>5}   {_shas(r[k], limit, 63)}")
     flagged = [x for x in r["rows"] if x["flags"]]
-    out += ["", f"Flagged commits ({len(flagged)}; newest {min(limit, len(flagged))} shown)",
+    shown = flagged if limit is None else flagged[-limit:]
+    out += ["", f"Flagged commits ({len(flagged)}; {len(shown)} shown, oldest first)",
             "  sha           time (UTC)            label        session   actor     trailer actors wt  flags"]
-    for x in flagged[-limit:]:
+    for x in shown:
         out.append(f"  {x['sha']:<13} {x['time']:<21} {x['label']:<12} {x['session']:<9} {x['actor']:<9} "
                    f"{'yes' if x['trailer'] else 'no':<7} {x['actors']:>6} {x['worktrees']:>3}  "
                    f"{','.join(x['flags'])}")
@@ -218,9 +271,9 @@ def render(r, limit=10):
             f"  2. Agent trailer patterns: {TRAILER_TEXT}.",
             "  3. A commit outside the transcript window (first to last record, +-300 s) is no data, not a "
             "gap; it is not counted as 'trailer, no session record'.",
-            f"  4. Actors = distinct (session, subagent) pairs with a transcript record whose cwd is in a "
-            f"worktree of this repo, {r['window_s']} s before or after the commit time. A session that only "
-            "reads the repo from another cwd is not seen.",
+            f"  4. Actors = distinct (session, subagent) pairs with a tool call {r['window_s']} s before or "
+            "after the commit time whose cwd is in a worktree of this repo, or whose Bash command names one "
+            "with `git -C` or `cd` (absolute or ~ paths). A relative path or a variable is not seen.",
             "  5. Transcripts are unsigned local files; a deleted transcript makes a commit MISSING.",
             "Nothing was written."]
     return "\n".join(out)

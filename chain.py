@@ -632,6 +632,8 @@ def main(argv=None):
         elif name == "audit":
             p.add_argument("--since")
             p.add_argument("--json", action="store_true")
+            p.add_argument("--hash-repos", action="store_true", help="show the repo as a short hash")
+            p.add_argument("--top", type=int, default=None, help="SHAs and rows per list (default all)")
         elif name == "demo":
             p.add_argument("--sha")
         else:
@@ -646,12 +648,12 @@ def main(argv=None):
     if a.cmd == "audit":
         import audit
         try:
-            r = audit.run(a.repo, a.since, a.transcripts, a.otel, a.policy, a.deploys, a.gh_hosts)
-        except subprocess.CalledProcessError as e:
-            why = (e.stderr or "").strip().splitlines()
-            print(f"chain.py: error: git failed: {why[0] if why else 'exit ' + str(e.returncode)}", file=sys.stderr)
+            r = audit.run(a.repo, a.since, a.transcripts, a.otel, a.policy, a.deploys, a.gh_hosts, a.hash_repos)
+        except (subprocess.CalledProcessError, OSError) as e:
+            # No git stderr here: it can hold the repo path.
+            print(f"chain.py: error: git failed ({type(e).__name__}); is --repo a git repo?", file=sys.stderr)
             return 2
-        print(json.dumps(r, indent=1) if a.json else audit.render(r))
+        print(json.dumps(r, indent=1) if a.json else audit.render(r, a.top))
         return 0
     src = dict(otel=otel_tool_results(a.otel), transcripts=TranscriptIndex(a.transcripts),
                policy=policy_rows(a.policy), deploys=deploy_rows(a.deploys))
