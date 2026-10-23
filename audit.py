@@ -16,33 +16,47 @@ import bisect, datetime, hashlib, json, os, re
 import chain
 
 WINDOW_S = 300
-# An agent trailer names a coding agent by its e-mail domain (Co-Authored-By), or by a fixed
-# "Generated with/by <agent>" line, or by a Generated-by / Assisted-by trailer. A person called
-# Claude or Devin with a private address is not an agent.
-AGENT_DOMAINS = ("anthropic.com", "openai.com", "cursor.com", "cursor.sh", "aider.chat", "cognition.ai",
-                 "devin.ai", "ampcode.com", "sourcegraph.com", "windsurf.com", "codeium.com", "opencode.ai",
-                 "cline.bot", "google.com")
+# An agent trailer names a coding agent by a known agent address, by an agent name with no e-mail,
+# by a fixed "Generated with/by <agent>" line, or by a Generated-by / Assisted-by trailer.
+# A person at an agent vendor's domain, or a non-agent bot (dependabot), is not an agent.
 AGENT_NAMES = (r"(?:Claude(?: Code)?|Codex|(?:GitHub )?Copilot|Cursor(?: Agent)?|Gemini(?: CLI| Code Assist)?"
                r"|Aider|OpenCode|Cline|Devin|Jules|Amp|Windsurf)")
-_COAUTHOR = re.compile(r"^[ \t]*Co-authored-by:[ \t]*([^<\n]*)<([^>\n]*)>", re.M | re.I)
-_GENERATED = re.compile(r"^[ \t]*(?:\W{1,3}[ \t]*)?Generated (?:with|by) \[?" + AGENT_NAMES + r"\b", re.M)
+AGENT_MAILS = {"noreply@anthropic.com", "claude@anthropic.com", "noreply@openai.com", "codex@openai.com",
+               "cursoragent@cursor.com", "noreply@aider.chat", "amp@ampcode.com", "noreply@opencode.ai",
+               "noreply@cline.bot", "noreply@windsurf.com", "copilot@github.com"}
+# GitHub no-reply address of an agent app or bot: <id>+<login>@users.noreply.github.com
+_GH_AGENT = re.compile(r"^(?:\d+\+)?(?:copilot|copilot-swe-agent(?:\[bot\])?|claude(?:\[bot\])?|openai-codex(?:\[bot\])?"
+                       r"|chatgpt-codex-connector(?:\[bot\])?|google-labs-jules(?:\[bot\])?"
+                       r"|gemini-code-assist(?:\[bot\])?|devin-ai-integration(?:\[bot\])?|cursor(?:\[bot\])?"
+                       r"|cursoragent|amp-agent(?:\[bot\])?)@users\.noreply\.github\.com$")
+_COAUTHOR = re.compile(r"^[ \t]*Co-authored-by:[ \t]*([^<\n]*?)[ \t]*(?:<([^>\n]*)>)?[ \t]*$", re.M | re.I)
+_NAME_ONLY = re.compile(r"^" + AGENT_NAMES + r"(?:\s+[\w.\-]+)*$", re.I)
+_GENERATED = re.compile(r"^[ \t]*(?:\W{1,3}[ \t]*)?Generated (?:with|by) \[?" + AGENT_NAMES + r"\b", re.M | re.I)
 _TRAILER_KEY = re.compile(r"^[ \t]*(?:Generated|Assisted|AI-assisted)-by:[ \t]*" + AGENT_NAMES + r"\b",
                           re.M | re.I)
-TRAILER_TEXT = ("Co-Authored-By with an e-mail at %s, or a Copilot or [bot] address; a line 'Generated "
-                "with/by <agent>'; a Generated-by or Assisted-by trailer naming an agent (Claude, Codex, "
-                "Copilot, Cursor, Gemini, Aider, OpenCode, Cline, Devin, Jules, Amp, Windsurf)"
-                % ", ".join(AGENT_DOMAINS))
-# A Bash command that runs git in, or cd's into, an absolute or ~ path.
-_CMD_PATH = re.compile(r"""(?:-C|\bcd)\s+(['"]?)((?:/|~/)[^'"\s;&|)]*)\1""")
+TRAILER_TEXT = ("Co-Authored-By with a known agent address (for example noreply@anthropic.com, "
+                "cursoragent@cursor.com, the GitHub no-reply address of Copilot, Jules, Devin, Codex or "
+                "Claude), or an agent name with no e-mail; a line 'Generated with/by <agent>'; a "
+                "Generated-by or Assisted-by trailer naming an agent")
+# A Bash command that runs git in, or cd's into, an absolute or ~ path (quoted paths may hold spaces).
+_CMD_PATH = re.compile(r"""(?:-C|\bcd)\s+(?:'((?:/|~/)[^']*)'|"((?:/|~/)[^"]*)"|((?:/|~/)[^'"\s;&|)]*))""")
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z0-9_.-]+)\1[^\n]*\n.*?(?:\n\2[ \t]*(?:\n|$)|\Z)", re.S)
 
 
 def is_agent_trailer(body):
-    for _, mail in _COAUTHOR.findall(body):
-        m = mail.strip().lower()
-        dom = m.rsplit("@", 1)[-1]
-        if any(dom == d or dom.endswith("." + d) for d in AGENT_DOMAINS) or "copilot" in m or "[bot]" in m:
+    for name, mail in _COAUTHOR.findall(body):
+        m = (mail or "").strip().lower()
+        if m:
+            if m in AGENT_MAILS or _GH_AGENT.match(m):
+                return True
+        elif _NAME_ONLY.match(name.strip()):
             return True
     return bool(_GENERATED.search(body) or _TRAILER_KEY.search(body))
+
+
+def _cmd_paths(cmd):
+    """Absolute or ~ paths that a command names with `git -C` or `cd`, outside heredoc bodies."""
+    return [a or b or c for a, b, c in _CMD_PATH.findall(_HEREDOC.sub("\n", cmd))]
 
 
 def _since_git(since):
@@ -86,18 +100,19 @@ class ActivityIndex:
                             continue
                         if not sid or ts is None or r.get("type") != "assistant" or not isinstance(content, list):
                             continue
-                        uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+                        uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"
+                                and isinstance(c.get("input"), dict)]
                         if not uses:
                             continue
                         times.append(ts)
-                        agent = (r.get("agentId") or "sidechain") if r.get("isSidechain") else None
+                        agent = str(r.get("agentId") or "sidechain") if r.get("isSidechain") else None
                         wts = set()
                         if isinstance(cwd, str):
                             wts.add(_worktree(cwd, worktrees))
                         for u in uses:
-                            cmd = (u.get("input") or {}).get("command") if u.get("name") == "Bash" else None
+                            cmd = u["input"].get("command") if u.get("name") == "Bash" else None
                             if isinstance(cmd, str):
-                                for _, p in _CMD_PATH.findall(cmd):
+                                for p in _cmd_paths(cmd):
                                     wts.add(_worktree(home + p[1:] if p.startswith("~") else p, worktrees))
                         for wt in wts - {None}:
                             self.recs.append((ts, sid, agent or "", wt))

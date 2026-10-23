@@ -154,6 +154,33 @@ class AuditTest(unittest.TestCase):
         row = next(x for x in r["rows"] if x["sha"] == self.sha[1][:12])
         self.assertEqual((row["actors"], row["worktrees"]), (3, 2))
 
+    def test_heredoc_cd_and_quoted_space_paths(self):
+        spaced = os.path.join(self.tmp.name, "my repo")
+        os.makedirs(spaced)
+        subprocess.run(["git", "-C", self.repo, "worktree", "add", "-q", "-b", "sp", spaced], check=True,
+                       capture_output=True)
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")
+        recs = [self._rec("s7", None, 1, elsewhere, [{"type": "tool_use", "id": "h1", "name": "Bash",
+                "input": {"command": f"cat > n.md <<'EOF'\ncd {self.repo}\nEOF"}}], "assistant", 5),
+                self._rec("s8", None, 1, elsewhere, [{"type": "tool_use", "id": "h2", "name": "Bash",
+                "input": {"command": f"git -C '{spaced}' status"}}], "assistant", 5),
+                self._rec("s9", 7, 1, elsewhere, [{"type": "tool_use", "id": "h3", "name": "Bash",
+                "input": "not a dict"}], "assistant", 5)]
+        recs[2]["isSidechain"] = True
+        self._write(os.path.join(self.projects, "p", "s7.jsonl"), recs)
+        r = self._run()
+        row = next(x for x in r["rows"] if x["sha"] == self.sha[1][:12])
+        self.assertEqual((row["actors"], row["worktrees"]), (2, 2))   # s1 main + s8; not s7 (heredoc)
+
+    def test_sidechain_without_agent_id_is_not_main(self):
+        p = os.path.join(self.projects, "p", "s1", "subagents", "agent-a1.jsonl")
+        recs = [json.loads(l) for l in open(p)]
+        for r in recs:
+            r.pop("agentId")
+        self._write(p, recs)
+        row = next(x for x in self._run()["rows"] if x["sha"] == self.sha[3][:12])
+        self.assertEqual(row["actor"], "subagent")
+
     def test_user_records_alone_are_not_actors(self):
         with open(os.path.join(self.projects, "p", "s6.jsonl"), "w") as f:
             f.write(json.dumps(self._out("s6", None, 1)) + "\n")
@@ -171,6 +198,15 @@ class AuditTest(unittest.TestCase):
               "x\n\nCo-Authored-By: Jules Martin <jm@example.org>",
               "x\n\nCo-Authored-By: Claude Dupont <claude@dupont.example>",
               "x\n\nCo-Authored-By: Ann <ann@pi.example>", "mention Claude in the body"]
+        yes += ["x\n\nCo-Authored-By: Claude", "x\n\ngenerated with claude code",
+                "x\n\nCo-authored-by: google-labs-jules[bot] <161369871+google-labs-jules[bot]@users.noreply.github.com>",
+                "x\n\nCo-authored-by: devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>"]
+        no += ["x\n\nCo-Authored-By: Jane Roe <jroe@google.com>",
+               "x\n\nCo-Authored-By: Sam Lee <sam@anthropic.com>",
+               "x\n\nCo-Authored-By: Kim Park <kim@openai.com>",
+               "x\n\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+               "x\n\nCo-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+               "x\n\nCo-Authored-By: Ann <ann.copilotfan@example.com>"]
         for m in yes:
             self.assertTrue(audit.is_agent_trailer(m), m)
         for m in no:

@@ -297,7 +297,7 @@ class TranscriptIndex:
         if not sid or ts is None:
             return
         # A subagent transcript carries the parent's sessionId plus its own agentId.
-        agent = rec.get("agentId") if rec.get("isSidechain") else None
+        agent = str(rec.get("agentId") or "sidechain") if rec.get("isSidechain") else None
         msg = rec.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
         for c in content if isinstance(content, list) else []:
