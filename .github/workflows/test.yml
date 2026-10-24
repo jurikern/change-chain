@@ -5,9 +5,10 @@ permissions:
 jobs:
   unittest:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.12"]
+        python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -15,4 +16,22 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: git config --global user.name ci && git config --global user.email ci@example.invalid
-      - run: python -W error::ResourceWarning -m unittest test_chain test_policy_snapshot test_review_probes
+      - run: python -W error::ResourceWarning -m unittest test_chain test_policy_snapshot test_review_probes test_audit
+  unittest-macos-py39:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: git config --global user.name ci && git config --global user.email ci@example.invalid
+      - run: python -W error::ResourceWarning -m unittest test_chain test_policy_snapshot test_review_probes test_audit
+  unittest-linux-py39:
+    # Python 3.9 is end-of-life; ubuntu-latest has no setup-python build for it, so use the official image.
+    runs-on: ubuntu-latest
+    container: python:3.9-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git >/dev/null
+      - uses: actions/checkout@v4
+      - run: git config --global user.name ci && git config --global user.email ci@example.invalid && git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: python -W error::ResourceWarning -m unittest test_chain test_policy_snapshot test_review_probes test_audit
